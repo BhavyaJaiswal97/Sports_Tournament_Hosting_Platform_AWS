@@ -1,0 +1,776 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+
+/* ───────── Types ───────── */
+interface Team { id: string; teamName: string; matchesPlayed: number; points: number; netScoreRate: number; }
+interface LiveMatch {
+  id: string; teamA: string; teamB: string; scoreA: number; scoreB: number;
+  status: 'SCHEDULED' | 'LIVE' | 'COMPLETED'; commentary: string; winProbA: number;
+  balls: number; history: number[]; venue: string;
+  runsA: number[]; runsB: number[]; feed: string[]; dist: number[];
+}
+interface NetCall { id: number; method: string; url: string; status: number | string; ms: number; }
+interface News { id: number; t: string; tag: string; text: string; }
+type Tab = 'home' | 'matches' | 'fixtures' | 'teams' | 'venues' | 'news' | 'stats' | 'aws';
+
+/* ───────── AWS config (.env) ───────── */
+const ENV = (import.meta as any).env || {};
+const API: string | undefined = ENV.VITE_API_BASE ? String(ENV.VITE_API_BASE).replace(/\/$/, '') : undefined;
+const API_KEY: string | undefined = ENV.VITE_API_KEY;
+const REGION: string = ENV.VITE_AWS_REGION || 'ap-southeast-2';
+const DDB: string = ENV.VITE_DDB_TABLE || 'LiveMatches';
+const TEAMS_TBL = 'ICPLTeams';
+const LAMBDA: string = ENV.VITE_LAMBDA_NAME || 'TournamentApi';
+const BUCKET: string = ENV.VITE_S3_BUCKET || '';
+const base = `https://${REGION}.console.aws.amazon.com`;
+const DDB_URL = `${base}/dynamodbv2/home?region=${REGION}#item-explorer?table=${DDB}`;
+const TEAMS_URL = `${base}/dynamodbv2/home?region=${REGION}#item-explorer?table=${TEAMS_TBL}`;
+const LINKS = [
+  { name: 'DynamoDB: LiveMatches', res: DDB, desc: 'Every score change is written here. Open it and watch the items update.', url: DDB_URL },
+  { name: 'DynamoDB: Standings', res: TEAMS_TBL, desc: 'League table. Points change when a match is ended.', url: TEAMS_URL },
+  { name: 'AWS Lambda', res: LAMBDA, desc: 'The function that handles every API request.', url: `${base}/lambda/home?region=${REGION}#/functions/${LAMBDA}` },
+  { name: 'API Gateway', res: 'icpl-api', desc: 'The public endpoints this website calls.', url: `${base}/apigateway/main/apis?region=${REGION}` },
+  { name: 'CloudWatch Logs', res: `/aws/lambda/${LAMBDA}`, desc: 'Real-time log of every request and database write.', url: `${base}/cloudwatch/home?region=${REGION}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${LAMBDA}` },
+  { name: 'Amazon S3', res: BUCKET || 'All buckets', desc: 'Fixture exports and static assets.', url: BUCKET ? `https://s3.console.aws.amazon.com/s3/buckets/${BUCKET}?region=${REGION}` : `https://s3.console.aws.amazon.com/s3/home?region=${REGION}` },
+];
+
+const VENUES: Record<string, { stadium: string; lat: number; lon: number; cap: string }> = {
+  Chennai: { stadium: 'M. A. Chidambaram Stadium', lat: 13.0628, lon: 80.2793, cap: '38,000' },
+  Mumbai: { stadium: 'Wankhede Stadium', lat: 18.9389, lon: 72.8258, cap: '33,000' },
+  Bangalore: { stadium: 'M. Chinnaswamy Stadium', lat: 12.9788, lon: 77.5996, cap: '40,000' },
+  Delhi: { stadium: 'Arun Jaitley Stadium', lat: 28.6377, lon: 77.2431, cap: '35,000' },
+};
+const COLORS: Record<string, string> = { 'Chennai Super Kings': '#e8a600', 'Mumbai Mavericks': '#3b82f6', 'Bangalore Blazers': '#e4002b', 'Delhi Dynamos': '#14b8a6' };
+const hash = (s: string) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+const tc = (n: string) => COLORS[n] || `hsl(${hash(n) % 360} 65% 48%)`;
+const abbr = (n: string) => n.split(' ').map((w) => w[0]).join('').slice(0, 3).toUpperCase();
+const sortT = (t: Team[]) => [...t].sort((a, b) => b.points - a.points || b.netScoreRate - a.netScoreRate);
+const load = <T,>(k: string, d: T): T => { try { const s = localStorage.getItem(k); return s ? JSON.parse(s) : d; } catch { return d; } };
+const wmo = (c: number) => (c === 0 ? 'Clear' : c < 4 ? 'Partly cloudy' : c < 60 ? 'Fog / drizzle' : c < 70 ? 'Rain' : c < 95 ? 'Showers' : 'Thunderstorm');
+const winner = (m: LiveMatch) => (m.scoreA >= m.scoreB ? m.teamA : m.teamB);
+const dayStr = (i: number) => new Date(2026, 10, 2 + i).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+const FN = ['Arjun', 'Rohan', 'Karthik', 'Vikram', 'Sanjay', 'Imran', 'Dev', 'Nikhil', 'Aditya', 'Rahul', 'Surya', 'Harsh'];
+const LN = ['Iyer', 'Sharma', 'Nair', 'Reddy', 'Khan', 'Patel', 'Menon', 'Verma', 'Das', 'Rao'];
+const ROLES = ['Batter', 'Bowler', 'All-rounder', 'Wicket-keeper', 'Bowler'];
+const squad = (team: string) => ROLES.map((role, i) => { const h = hash(team + i); return { name: `${FN[h % 12]} ${LN[(h >> 3) % 10]}`, role, runs: 120 + (h % 260), wkts: role === 'Bowler' ? 4 + (h % 9) : role === 'All-rounder' ? 2 + (h % 5) : h % 2, team }; });
+
+const normTeam = (t: any): Team => ({ id: String(t.id ?? t.teamId ?? Date.now()), teamName: String(t.teamName ?? t.name), matchesPlayed: Number(t.matchesPlayed ?? 0), points: Number(t.points ?? 0), netScoreRate: Number(t.netScoreRate ?? 0) });
+const normMatch = (m: any): LiveMatch => {
+  const sa = Number(m.scoreA ?? 0), sb = Number(m.scoreB ?? 0), wp = Number(m.winProbA ?? 50);
+  return { id: String(m.id ?? m.matchId), teamA: m.teamA, teamB: m.teamB, scoreA: sa, scoreB: sb, status: m.status ?? 'SCHEDULED', commentary: m.commentary ?? '', winProbA: wp, balls: Number(m.balls ?? 0), history: Array.isArray(m.history) && m.history.length ? m.history : [wp], venue: m.venue ?? 'Chennai', runsA: Array.isArray(m.runsA) && m.runsA.length ? m.runsA : [0, sa], runsB: Array.isArray(m.runsB) && m.runsB.length ? m.runsB : [0, sb], feed: Array.isArray(m.feed) ? m.feed : [], dist: Array.isArray(m.dist) && m.dist.length === 5 ? m.dist : [0, 0, 0, 0, 0] };
+};
+const pick = (r: any, key: string) => (Array.isArray(r) ? r : Array.isArray(r?.[key]) ? r[key] : null);
+
+const initialTeams: Team[] = [
+  { id: '1', teamName: 'Chennai Super Kings', matchesPlayed: 2, points: 6, netScoreRate: 1.42 },
+  { id: '2', teamName: 'Mumbai Mavericks', matchesPlayed: 2, points: 4, netScoreRate: 0.85 },
+  { id: '3', teamName: 'Bangalore Blazers', matchesPlayed: 2, points: 3, netScoreRate: -0.15 },
+  { id: '4', teamName: 'Delhi Dynamos', matchesPlayed: 2, points: 0, netScoreRate: -2.1 },
+];
+const initialMatches: LiveMatch[] = [
+  normMatch({ id: 'M-101', teamA: 'Chennai Super Kings', teamB: 'Mumbai Mavericks', scoreA: 184, scoreB: 172, status: 'COMPLETED', commentary: 'Chennai Super Kings won by 12 runs.', winProbA: 100, balls: 240, history: [50, 55, 60, 52, 70, 100], venue: 'Chennai', runsA: [0, 30, 62, 95, 130, 160, 184], runsB: [0, 28, 55, 90, 118, 150, 172], feed: ['1', '4', '0', '6', 'W', '1', '1', '4', '0', '1', '6', '0'], dist: [60, 90, 40, 20, 14] }),
+  normMatch({ id: 'M-102', teamA: 'Bangalore Blazers', teamB: 'Delhi Dynamos', scoreA: 142, scoreB: 138, status: 'LIVE', commentary: 'Final over. Six runs needed off three balls.', winProbA: 68, balls: 200, history: [50, 52, 61, 58, 68], venue: 'Bangalore', runsA: [0, 25, 51, 80, 110, 142], runsB: [0, 22, 48, 85, 112, 138], feed: ['1', '0', '4', '1', '6', 'W', '0', '1', '4', '1', '0', '1'], dist: [55, 80, 35, 18, 12] }),
+];
+const initialNews: News[] = [
+  { id: 1, t: '09:10', tag: 'PREVIEW', text: 'Bangalore Blazers and Delhi Dynamos meet in a high-stakes clash at the Chinnaswamy.' },
+  { id: 2, t: '08:30', tag: 'REPORT', text: 'Chennai Super Kings edge Mumbai Mavericks by 12 runs at Chepauk.' },
+  { id: 3, t: '08:00', tag: 'LEAGUE', text: 'Season 4 of the Inter-College Premier League is under way with four teams.' },
+];
+
+const DIST_IDX: Record<string, number> = { '0': 0, '1': 1, '4': 2, '6': 3, W: 4 };
+const step = (m: LiveMatch, side: 'A' | 'B', label: string, text: string): LiveMatch => {
+  const run = label === 'W' ? 0 : Number(label);
+  const scoreA = m.scoreA + (side === 'A' ? run : 0), scoreB = m.scoreB + (side === 'B' ? run : 0);
+  const winProbA = Math.min(98, Math.max(2, Math.round(50 + (scoreA - scoreB) * 1.6)));
+  return { ...m, scoreA, scoreB, winProbA, balls: m.balls + 1, status: 'LIVE', history: [...m.history.slice(-59), winProbA], runsA: [...m.runsA.slice(-59), scoreA], runsB: [...m.runsB.slice(-59), scoreB], feed: [...m.feed.slice(-11), label], dist: m.dist.map((d, i) => (i === DIST_IDX[label] ? d + 1 : d)), commentary: text };
+};
+const ball = (m: LiveMatch): LiveMatch => {
+  const r = Math.random(), side = Math.random() < 0.5 ? 'A' : 'B', who = side === 'A' ? m.teamA : m.teamB;
+  const [l, t] = r < 0.12 ? ['W', 'Wicket. Breakthrough for the bowling side.'] : r < 0.3 ? ['6', 'Six. Cleared the boundary.'] : r < 0.5 ? ['4', 'Four. Driven through the covers.'] : r < 0.8 ? ['1', 'Single taken.'] : ['0', 'Dot ball.'];
+  return step(m, side, l, `${who}: ${t}`);
+};
+
+const CSS = `
+:root{--navy:#0b1b3a;--ink:#111827;--mute:#6b7280;--line:#e5e7eb;--panel:#f3f4f6;--accent:#e4002b;--live:#0a7d3c;--bg:#fff}
+*{box-sizing:border-box}body{margin:0}
+.app{min-height:100vh;background:var(--bg);color:var(--ink);font-family:"Helvetica Neue",Arial,system-ui,sans-serif;font-size:14px;line-height:1.55;font-feature-settings:"tnum"}
+.wrap{max-width:1200px;margin:0 auto;padding:0 24px}
+.top{background:#050d1f;color:#9ca3af;font-size:12px}.top .wrap{display:flex;justify-content:space-between;align-items:center;height:34px;gap:16px}
+.top button{background:none;border:0;color:#9ca3af;font:inherit;cursor:pointer;padding:0 8px;height:34px}.top button.on{color:#fff;box-shadow:inset 0 -2px 0 var(--accent)}
+.nav{background:var(--navy);color:#fff;position:sticky;top:0;z-index:30}
+.nav .wrap{display:flex;align-items:center;gap:28px;height:62px}
+.logo{display:flex;align-items:center;gap:12px;font-weight:800;font-size:17px;white-space:nowrap}
+.logo i{font-style:normal;width:34px;height:34px;background:var(--accent);display:grid;place-items:center;font-size:12px}
+.tabs{display:flex;gap:2px;height:100%;overflow-x:auto}
+.tabs button{background:none;border:0;color:#cbd5e1;font:inherit;font-weight:600;padding:0 14px;cursor:pointer;white-space:nowrap;border-bottom:3px solid transparent}
+.tabs button:hover{color:#fff}.tabs button.on{color:#fff;border-bottom-color:var(--accent)}
+.nav .right{margin-left:auto;display:flex;gap:8px}
+.ticker{border-bottom:1px solid var(--line)}.ticker .wrap{display:flex;overflow-x:auto}
+.tk{display:flex;align-items:center;gap:10px;padding:10px 20px 10px 0;margin-right:20px;border-right:1px solid var(--line);white-space:nowrap;font-size:13px}
+.tag{font-size:10px;font-weight:700;letter-spacing:.1em;padding:2px 7px;border:1px solid currentColor;white-space:nowrap}
+.tag.live{color:var(--live)}.tag.done{color:var(--mute)}.tag.next{color:var(--accent)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--live);margin-right:6px;animation:b 1.4s infinite}@keyframes b{50%{opacity:.25}}
+.hero{background:radial-gradient(900px 300px at 80% -20%,#1e3a8a66,transparent),linear-gradient(120deg,#0b1b3a,#0f2347);color:#fff;padding:28px 0 34px}
+.hero-h{display:flex;justify-content:space-between;font-size:11px;letter-spacing:.12em;color:#93a4c3;margin-bottom:18px}
+.hero-g{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:40px;align-items:center}
+@media(max-width:900px){.hero-g{grid-template-columns:1fr;gap:24px}}
+.hs{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;text-align:center}
+.hs .n{font-weight:700;margin-top:8px}.hs .big{font-size:56px;font-weight:200;line-height:1}.hs .big em{font-style:normal;color:#64748b;margin:0 8px}
+.crest{border-radius:50%;display:inline-grid;place-items:center;color:#fff;font-weight:800;box-shadow:inset 0 0 0 2px #ffffff40;flex:none}
+.split{display:flex;height:8px;background:#1e293b;overflow:hidden}.split i{display:block;height:100%;transition:width .5s}
+.fd{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:10px;font-weight:700;margin-right:4px;color:#fff}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:48px;padding:32px 0 64px}
+@media(max-width:960px){.layout{grid-template-columns:1fr;gap:32px}}
+.page{padding:32px 0 64px}
+h2.sec{margin:0 0 14px;font-size:18px;font-weight:800;padding-left:12px;border-left:4px solid var(--accent);line-height:1.2;text-transform:uppercase;letter-spacing:.03em}
+h3.side{margin:0 0 10px;font-size:12px;font-weight:800;padding-bottom:8px;border-bottom:2px solid var(--ink);letter-spacing:.08em;text-transform:uppercase}
+table.t{width:100%;border-collapse:collapse;font-size:13px}
+table.t th{font-size:11px;font-weight:700;color:var(--mute);text-align:left;padding:8px 10px;border-bottom:2px solid var(--ink);letter-spacing:.06em}
+table.t td{padding:10px;border-bottom:1px solid var(--line)}table.t tbody tr:hover{background:var(--panel)}
+.r{text-align:right}.c{text-align:center}.pos{color:var(--live)}.neg{color:var(--accent)}
+.btn{font:inherit;font-size:12px;font-weight:700;background:#fff;color:var(--ink);border:1px solid var(--ink);padding:6px 14px;cursor:pointer;transition:all .15s;text-decoration:none;display:inline-block}
+.btn:hover:not(:disabled){background:var(--ink);color:#fff}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}.btn.pri:hover:not(:disabled){background:var(--ink);border-color:var(--ink)}
+.btn.ghost{border-color:var(--line);color:var(--mute)}.btn.sel{background:var(--ink);color:#fff}
+.btn.lt{background:transparent;color:#fff;border-color:#ffffff66}.btn.lt:hover{background:#fff;color:var(--navy)}
+.inp{font:inherit;width:100%;padding:8px 10px;border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:0}.inp:focus{outline:none;border-color:var(--ink)}
+.side-block{margin-bottom:32px}
+.kv{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}.kv span:first-child{color:var(--mute)}
+.mc{border:1px solid var(--line);margin-bottom:20px}
+.mc-h{display:flex;justify-content:space-between;padding:9px 16px;background:var(--panel);font-size:11px;color:var(--mute);letter-spacing:.06em}
+.mc-b{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:18px 16px;gap:16px}
+.mc-b .tm{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;cursor:pointer}
+.mc-b .sc{font-size:36px;font-weight:300;text-align:center;line-height:1}.mc-b .sc em{font-style:normal;color:var(--mute);margin:0 6px}
+.mc-f{padding:12px 16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;font-size:13px}
+.bar{height:4px;background:var(--line)}.bar i{display:block;height:100%;background:var(--accent);transition:width .5s}
+.kpi{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);margin-bottom:32px}
+.kpi div{padding:16px 18px;border-right:1px solid var(--line)}.kpi div:last-child{border:0}
+.kpi small{display:block;color:var(--mute);font-size:11px;letter-spacing:.06em}.kpi b{font-size:28px;font-weight:300}
+@media(max-width:600px){.kpi{grid-template-columns:repeat(2,1fr)}}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:32px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:20px}
+.card{border:1px solid var(--line);padding:18px;transition:border-color .2s,box-shadow .2s,transform .2s}
+.card.click{cursor:pointer}.card:hover{border-color:var(--ink);box-shadow:0 8px 20px -12px #0007;transform:translateY(-2px)}
+.res{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--panel);padding:3px 8px;display:inline-block}
+.bk{display:flex;gap:48px;align-items:center;flex-wrap:wrap}.bk .g{border:1px solid var(--ink);min-width:240px}
+.bk .g div{display:flex;justify-content:space-between;padding:9px 14px;font-weight:600}.bk .g div+div{border-top:1px solid var(--line)}
+.bk .g .hd{background:var(--ink);color:#fff;font-size:10px;letter-spacing:.1em}
+.con{background:#0b0e14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:14px;height:260px;overflow:auto}
+.pre{background:#0b0e14;color:#7ee787;font-family:ui-monospace,Menlo,monospace;font-size:11px;padding:12px;max-height:240px;overflow:auto;margin:0}
+.toast{position:fixed;left:24px;bottom:24px;background:var(--ink);color:#fff;padding:10px 16px;font-size:13px;z-index:60;border-left:4px solid var(--accent);animation:up .25s}
+@keyframes up{from{opacity:0;transform:translateY(8px)}}
+.modal{position:fixed;inset:0;background:#000a;z-index:50;display:grid;place-items:center;padding:20px}
+.mbox{background:#fff;width:min(640px,100%);max-height:90vh;overflow:auto;animation:up .2s}
+.mhead{padding:24px;color:#fff;display:flex;align-items:center;gap:16px}
+.news{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);animation:up .3s}
+.news time{color:var(--mute);font-size:12px;width:44px;flex:none}
+.stepn{display:flex;gap:14px;padding:10px 0;border-bottom:1px solid var(--line)}.stepn b{flex:none;width:26px;height:26px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:12px}
+footer{background:var(--navy);color:#94a3b8;font-size:12px;padding:26px 0}
+`;
+
+/* ───────── Visual components ───────── */
+const Crest = ({ name, size = 44 }: { name: string; size?: number }) => <span className="crest" style={{ width: size, height: size, background: tc(name), fontSize: size * 0.3 }}>{abbr(name)}</span>;
+const Worm = ({ a, b, ca, cb, h = 130, max }: { a: number[]; b: number[]; ca: string; cb: string; h?: number; max?: number }) => {
+  const w = 520, n = Math.max(a.length, b.length, 2), top = max ?? Math.max(10, ...a, ...b) * 1.1;
+  const pts = (d: number[]) => d.map((v, i) => `${(i / (n - 1)) * w},${h - (v / top) * h}`).join(' ');
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ width: '100%', height: h, display: 'block', overflow: 'visible' }}>
+      {[0.25, 0.5, 0.75].map((g) => <line key={g} x1="0" x2={w} y1={h * g} y2={h * g} stroke="currentColor" opacity=".12" strokeDasharray="4 4" vectorEffect="non-scaling-stroke" />)}
+      <polygon points={`0,${h} ${pts(a)} ${((a.length - 1) / (n - 1)) * w},${h}`} fill={ca} opacity=".14" />
+      <polyline points={pts(b)} fill="none" stroke={cb} strokeWidth="2.2" vectorEffect="non-scaling-stroke" />
+      <polyline points={pts(a)} fill="none" stroke={ca} strokeWidth="2.2" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+};
+const Feed = ({ feed }: { feed: string[] }) => {
+  const col: Record<string, string> = { W: '#e4002b', '6': '#7c3aed', '4': '#2563eb', '1': '#64748b', '0': '#94a3b8' };
+  return <span>{[...Array(Math.max(0, 12 - feed.length)).fill(''), ...feed].map((f, i) => <span key={i} className="fd" style={{ background: f ? col[f] : 'transparent', border: f ? 'none' : '1px dashed #94a3b8' }}>{f}</span>)}</span>;
+};
+const Prob = ({ m, dark }: { m: LiveMatch; dark?: boolean }) => (
+  <div>
+    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, letterSpacing: '.08em', marginBottom: 6, color: dark ? '#93a4c3' : 'var(--mute)' }}><span>{abbr(m.teamA)} {m.winProbA}%</span><span>WIN PROBABILITY</span><span>{100 - m.winProbA}% {abbr(m.teamB)}</span></div>
+    <div className="split" style={dark ? undefined : { background: 'var(--line)' }}><i style={{ width: `${m.winProbA}%`, background: tc(m.teamA) }} /><i style={{ width: `${100 - m.winProbA}%`, background: tc(m.teamB) }} /></div>
+  </div>
+);
+const Donut = ({ dist }: { dist: number[] }) => {
+  const labels = ['Dot', 'Singles', 'Fours', 'Sixes', 'Wickets'], cols = ['#94a3b8', '#64748b', '#2563eb', '#7c3aed', '#e4002b'];
+  const total = dist.reduce((a, b) => a + b, 0) || 1, C = 2 * Math.PI * 36; let off = 0;
+  return (
+    <div style={{ display: 'flex', gap: 24, alignItems: 'center', flexWrap: 'wrap' }}>
+      <svg width="140" height="140" viewBox="0 0 100 100"><g transform="rotate(-90 50 50)">{dist.map((d, i) => { const len = (d / total) * C, el = <circle key={i} cx="50" cy="50" r="36" fill="none" stroke={cols[i]} strokeWidth="14" strokeDasharray={`${len} ${C - len}`} strokeDashoffset={-off} />; off += len; return el; })}</g><text x="50" y="54" textAnchor="middle" fontSize="14" fontWeight="300" fill="currentColor">{dist.reduce((a, b) => a + b, 0)}</text></svg>
+      <div style={{ fontSize: 12 }}>{labels.map((l, i) => <div key={l} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '2px 0' }}><i style={{ width: 10, height: 10, background: cols[i], display: 'inline-block' }} />{l}<b style={{ marginLeft: 'auto', paddingLeft: 16 }}>{dist[i]}</b></div>)}</div>
+    </div>
+  );
+};
+const Ext = ({ href, children, cls = 'btn' }: { href: string; children: React.ReactNode; cls?: string }) => <a className={cls} href={href} target="_blank" rel="noreferrer noopener">{children}</a>;
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('home');
+  const [role, setRole] = useState<'ADMIN' | 'REFEREE' | 'SPECTATOR'>('ADMIN');
+  const [teams, setTeams] = useState<Team[]>(() => load('icpl_v6_teams', initialTeams));
+  const [matches, setMatches] = useState<LiveMatch[]>(() => load<any[]>('icpl_v6_matches', initialMatches).map(normMatch));
+  const [votes, setVotes] = useState<Record<string, number>>(() => load('icpl_v6_votes', {}));
+  const [picks, setPicks] = useState<Record<string, string>>(() => load('icpl_v6_picks', {}));
+  const [news, setNews] = useState<News[]>(initialNews);
+  const [newTeam, setNewTeam] = useState('');
+  const [query, setQuery] = useState('');
+  const [auto, setAuto] = useState(false);
+  const [liveSync, setLiveSync] = useState(!!API);
+  const [lastSync, setLastSync] = useState('');
+  const [writes, setWrites] = useState(0);
+  const [raw, setRaw] = useState<any[]>([]);
+  const [selMatch, setSelMatch] = useState('');
+  const [venue, setVenue] = useState('Chennai');
+  const [profile, setProfile] = useState<string | null>(null);
+  const [cmpA, setCmpA] = useState(''); const [cmpB, setCmpB] = useState('');
+  const [wx, setWx] = useState<{ temp: number; wind: number; desc: string; src: string } | null>(null);
+  const [wxLoading, setWxLoading] = useState(false);
+  const [net, setNet] = useState<NetCall[]>([]);
+  const [toast, setToastMsg] = useState('');
+  const [sync, setSync] = useState<'LOCAL' | 'ONLINE' | 'ERROR'>(API ? 'ONLINE' : 'LOCAL');
+  const [loaded, setLoaded] = useState(!API);
+  const [logs, setLogs] = useState<string[]>([API ? `[config] backend: ${API}` : '[config] VITE_API_BASE not set: running in local mode']);
+  const [cmd, setCmd] = useState('');
+  const idRef = useRef(1);
+  const synced = useRef<Record<string, string>>({});
+
+  useEffect(() => { try { localStorage.setItem('icpl_v6_teams', JSON.stringify(teams)); localStorage.setItem('icpl_v6_matches', JSON.stringify(matches)); localStorage.setItem('icpl_v6_votes', JSON.stringify(votes)); localStorage.setItem('icpl_v6_picks', JSON.stringify(picks)); } catch { /* ignore */ } }, [teams, matches, votes, picks]);
+
+  const log = (m: string) => setLogs((p) => [`${new Date().toLocaleTimeString()}  ${m}`, ...p.slice(0, 59)]);
+  const say = (m: string) => { setToastMsg(m); setTimeout(() => setToastMsg(''), 3000); };
+  const pushNews = (tag: string, text: string) => setNews((p) => [{ id: Date.now() + Math.random(), t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), tag, text }, ...p.slice(0, 29)]);
+
+  const ajax = async <T,>(method: string, url: string, work: () => Promise<T>): Promise<T | null> => {
+    const id = idRef.current++; const t0 = performance.now();
+    setNet((p) => [{ id, method, url, status: '...', ms: 0 }, ...p.slice(0, 14)]);
+    try { const r = await work(); setNet((p) => p.map((c) => (c.id === id ? { ...c, status: 200, ms: Math.round(performance.now() - t0) } : c))); return r; }
+    catch (e) { setNet((p) => p.map((c) => (c.id === id ? { ...c, status: 'ERR', ms: Math.round(performance.now() - t0) } : c))); say('Request failed: ' + (e as Error).message); return null; }
+  };
+  const delay = <T,>(v: T, ms = 450) => new Promise<T>((r) => setTimeout(() => r(v), ms));
+  const http = async (method: string, path: string, body?: unknown) => {
+    const r = await fetch((API || '') + path, { method, headers: { 'Content-Type': 'application/json', ...(API_KEY ? { 'x-api-key': API_KEY } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const txt = await r.text(); return txt ? JSON.parse(txt) : {};
+  };
+  const call = async (method: string, path: string, body?: unknown, simulated: any = {}): Promise<any | null> => {
+    const res = await ajax(method, (API || '') + path, () => (API ? http(method, path, body) : delay(simulated)));
+    if (API) setSync(res === null ? 'ERROR' : 'ONLINE');
+    return res;
+  };
+
+  useEffect(() => {
+    if (!API) return;
+    (async () => {
+      const ta = pick(await call('GET', '/teams'), 'teams'), ma = pick(await call('GET', '/matches'), 'matches');
+      if (ta && ta.length) { setTeams(sortT(ta.map(normTeam))); log(`[dynamodb] loaded ${ta.length} teams`); }
+      if (ma && ma.length) { const n = ma.map(normMatch); n.forEach((x: LiveMatch) => (synced.current[x.id] = JSON.stringify(x))); setMatches(n); setRaw(ma); log(`[dynamodb] loaded ${n.length} matches`); }
+      setLoaded(true);
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  useEffect(() => {
+    if (!API || !loaded) return;
+    const t = setTimeout(() => {
+      matches.forEach((m) => {
+        const s = JSON.stringify(m); if (synced.current[m.id] === s) return;
+        synced.current[m.id] = s;
+        call('PUT', `/matches/${m.id}`, m).then((r) => { if (r) { setWrites((w) => w + 1); log(`[dynamodb] PutItem ${DDB}/${m.id}  ${m.scoreA}-${m.scoreB}`); } else delete synced.current[m.id]; });
+      });
+    }, 900);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line
+  }, [matches, loaded]);
+
+  useEffect(() => {
+    if (!API || !liveSync || !loaded) return;
+    const poll = async () => {
+      try {
+        const ma = pick(await http('GET', '/matches'), 'matches'), ta = pick(await http('GET', '/teams'), 'teams');
+        if (ma) { setRaw(ma); setMatches((prev) => {
+          const map = new Map(prev.map((x) => [x.id, x])); let changed = false;
+          ma.map(normMatch).forEach((r: LiveMatch) => { const rs = JSON.stringify(r), local = map.get(r.id); if (!local || (JSON.stringify(local) === synced.current[r.id] && rs !== synced.current[r.id])) { map.set(r.id, r); synced.current[r.id] = rs; changed = true; } });
+          return changed ? Array.from(map.values()) : prev;
+        }); }
+        if (ta) setTeams((prev) => { const n = sortT(ta.map(normTeam)); return JSON.stringify(n) === JSON.stringify(prev) ? prev : n; });
+        setSync('ONLINE'); setLastSync(new Date().toLocaleTimeString());
+      } catch { setSync('ERROR'); }
+    };
+    poll(); const t = setInterval(poll, 3000);
+    return () => clearInterval(t);
+  }, [liveSync, loaded]);
+
+  const fetchWeather = async (v = venue) => {
+    setWxLoading(true);
+    const { lat, lon } = VENUES[v];
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,weather_code`;
+    const d = await ajax('GET', url, async () => {
+      const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 6000);
+      try { const r = await fetch(url, { signal: ctl.signal }); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); } finally { clearTimeout(to); }
+    });
+    if (d?.current) setWx({ temp: d.current.temperature_2m, wind: d.current.wind_speed_10m, desc: wmo(d.current.weather_code), src: 'Open-Meteo' });
+    else setWx({ temp: 31, wind: 12, desc: 'Partly cloudy', src: 'Offline fallback' });
+    setWxLoading(false);
+  };
+  useEffect(() => { fetchWeather(venue); /* eslint-disable-next-line */ }, [venue]);
+
+  useEffect(() => {
+    if (!auto) return;
+    const t = setInterval(() => setMatches((p) => p.map((m) => (m.status === 'LIVE' ? ball(m) : m))), 1200);
+    return () => clearInterval(t);
+  }, [auto]);
+
+  const addRuns = (id: string, side: 'A' | 'B', n: number) => setMatches((p) => p.map((m) => (m.id === id ? step(m, side, String(n), `${n} run${n > 1 ? 's' : ''} for ${side === 'A' ? m.teamA : m.teamB}.`) : m)));
+  const bowl = (id: string) => setMatches((p) => p.map((m) => (m.id === id ? ball(m) : m)));
+  const startMatch = (m: LiveMatch) => { setMatches((p) => p.map((x) => (x.id === m.id ? { ...x, status: 'LIVE', commentary: 'Play has begun.' } : x))); pushNews('LIVE', `${m.teamA} v ${m.teamB} is under way at ${VENUES[m.venue]?.stadium || m.venue}.`); };
+
+  const finalize = async (m: LiveMatch) => {
+    const win = winner(m), lose = win === m.teamA ? m.teamB : m.teamA;
+    const d = Number((Math.max(1, Math.abs(m.scoreA - m.scoreB)) * 0.05).toFixed(2));
+    const res = await call('POST', `/matches/${m.id}/finalize`, { matchId: m.id, winner: win, loser: lose, scoreA: m.scoreA, scoreB: m.scoreB, nrrDelta: d }, {});
+    if (!res) return;
+    const done = { ...m, status: 'COMPLETED' as const, commentary: `${win} won the match.` };
+    synced.current[m.id] = JSON.stringify(done);
+    setMatches((p) => p.map((x) => (x.id === m.id ? done : x)));
+    const fromApi = pick(res, 'teams');
+    if (fromApi && fromApi.length) setTeams(sortT(fromApi.map(normTeam)));
+    else setTeams((p) => sortT(p.map((t) => t.teamName === win ? { ...t, matchesPlayed: t.matchesPlayed + 1, points: t.points + 3, netScoreRate: +(t.netScoreRate + d).toFixed(2) } : t.teamName === lose ? { ...t, matchesPlayed: t.matchesPlayed + 1, netScoreRate: +(t.netScoreRate - d).toFixed(2) } : t)));
+    log(`[dynamodb] ${TEAMS_TBL}: ${win} +3 points`); pushNews('RESULT', `${win} beat ${lose} (${m.scoreA}-${m.scoreB}) and move up the table.`); say(`Final: ${win} won ${m.id}`);
+  };
+  const addTeam = async (e: React.FormEvent) => {
+    e.preventDefault(); const name = newTeam.trim(); if (!name) return;
+    if (teams.some((t) => t.teamName.toLowerCase() === name.toLowerCase())) return say('Team already registered');
+    const res = await call('POST', '/teams', { teamName: name }); if (!res) return;
+    const created = res.team || res;
+    setTeams((p) => sortT([...p, normTeam({ ...created, teamName: name, id: created.id ?? Date.now() })]));
+    log(`[dynamodb] PutItem ${TEAMS_TBL}/${name}`); pushNews('LEAGUE', `${name} join the league.`); say('Team registered'); setNewTeam('');
+  };
+  const generate = async () => {
+    const top = sortT(teams); if (top.length < 2) return say('At least two teams required');
+    const vs = Object.keys(VENUES), fx: LiveMatch[] = [];
+    for (let i = 0; i + 1 < top.length; i += 2) fx.push(normMatch({ id: `M-${Date.now().toString().slice(-6)}-${i}`, teamA: top[i].teamName, teamB: top[i + 1].teamName, venue: vs[(i / 2) % vs.length], commentary: 'Scheduled.', runsA: [0], runsB: [0] }));
+    const res = await call('POST', '/fixtures/generate', { fixtures: fx }); if (!res) return;
+    const out: LiveMatch[] = (pick(res, 'fixtures') || fx).map(normMatch);
+    out.forEach((x) => (synced.current[x.id] = JSON.stringify(x)));
+    setMatches((p) => [...out, ...p]); pushNews('FIXTURES', `${out.length} new fixtures published.`); say(`${out.length} fixtures generated`);
+  };
+  const exportCSV = () => {
+    const csv = 'Rank,Team,Played,NRR,Points\n' + sortT(teams).map((t, i) => `${i + 1},"${t.teamName}",${t.matchesPlayed},${t.netScoreRate},${t.points}`).join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = 'standings.csv'; a.click();
+  };
+  const addToCal = (m: LiveMatch, i: number) => {
+    const d = new Date(2026, 10, 2 + i, 19, 30), f = (x: Date) => x.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    const ics = `BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nSUMMARY:${m.teamA} v ${m.teamB}\nLOCATION:${VENUES[m.venue]?.stadium || m.venue}\nDTSTART:${f(d)}\nDTEND:${f(new Date(d.getTime() + 3.5 * 3600000))}\nEND:VEVENT\nEND:VCALENDAR`;
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([ics], { type: 'text/calendar' })); a.download = `${m.id}.ics`; a.click();
+  };
+  const reset = () => { setTeams(initialTeams); setMatches(initialMatches); setVotes({}); setPicks({}); synced.current = {}; log('[system] local state reset'); say('Local data reset'); };
+  const refresh = async () => {
+    const t = pick(await call('GET', '/teams'), 'teams'), m = pick(await call('GET', '/matches'), 'matches');
+    if (t) setTeams(sortT(t.map(normTeam)));
+    if (m) { const n = m.map(normMatch); n.forEach((x: LiveMatch) => (synced.current[x.id] = JSON.stringify(x))); setMatches(n); setRaw(m); }
+    say('Synced from AWS');
+  };
+  const sendTest = () => {
+    const m = matches.find((x) => x.status === 'LIVE'); if (!m) return say('No live match. Start one in Live Scores first.');
+    addRuns(m.id, 'A', 1); say(`Sent +1 for ${m.teamA}. Refresh the DynamoDB items page to see it.`);
+  };
+  const runCmd = (raw0: string) => {
+    const [c, ...a] = raw0.trim().split(/\s+/); if (!c) return; log(`$ ${raw0}`);
+    if (c === 'help') log('help | standings | matches | sim <id> | auto on|off | sync | links | reset | clear');
+    else if (c === 'standings') sortT(teams).forEach((t, i) => log(`${i + 1}. ${t.teamName}  ${t.points} pts`));
+    else if (c === 'matches') matches.forEach((m) => log(`${m.id}  ${m.teamA} ${m.scoreA}-${m.scoreB} ${m.teamB}  ${m.status}`));
+    else if (c === 'sim') { matches.some((x) => x.id === a[0]) ? bowl(a[0]) : log('match not found'); }
+    else if (c === 'auto') setAuto(a[0] === 'on');
+    else if (c === 'sync') { API ? refresh() : log('no backend configured'); }
+    else if (c === 'links') LINKS.forEach((l) => log(`${l.name}: ${l.url}`));
+    else if (c === 'reset') reset(); else if (c === 'clear') setLogs([]);
+    else log(`unknown command: ${c}`);
+  };
+
+  const sorted = useMemo(() => sortT(teams).filter((t) => t.teamName.toLowerCase().includes(query.toLowerCase())), [teams, query]);
+  const top4 = sortT(teams).slice(0, 4);
+  const maxPts = Math.max(1, ...teams.map((t) => t.points));
+  const maxNrr = Math.max(0.5, ...teams.map((t) => Math.abs(t.netScoreRate)));
+  const canScore = role !== 'SPECTATOR';
+  const totalVotes = Object.values(votes).reduce((a, b) => a + b, 0) || 1;
+  const feat = matches.find((m) => m.status === 'LIVE') || matches[0];
+  const sel = matches.find((m) => m.id === selMatch) || feat;
+  const players = useMemo(() => teams.flatMap((t) => squad(t.teamName)), [teams]);
+  const syncColor = sync === 'ONLINE' ? '#34c26e' : sync === 'ERROR' ? '#ef4458' : '#9ca3af';
+  const tag = (s: LiveMatch['status']) => (s === 'LIVE' ? 'live' : s === 'COMPLETED' ? 'done' : 'next');
+  const tagText = (s: LiveMatch['status']) => (s === 'LIVE' ? 'LIVE' : s === 'COMPLETED' ? 'FINAL' : 'UPCOMING');
+  const tabs: [Tab, string][] = [['home', 'Home'], ['matches', 'Live Scores'], ['fixtures', 'Fixtures'], ['teams', 'Teams'], ['venues', 'Venues'], ['news', 'News'], ['stats', 'Statistics'], ['aws', 'AWS Demo']];
+  const pickCount = matches.filter((m) => m.status === 'COMPLETED' && picks[m.id]).length;
+  const pickRight = matches.filter((m) => m.status === 'COMPLETED' && picks[m.id] === winner(m)).length;
+  const cA = teams.find((t) => t.teamName === (cmpA || teams[0]?.teamName)), cB = teams.find((t) => t.teamName === (cmpB || teams[1]?.teamName));
+
+  const Controls = ({ m }: { m: LiveMatch }) => !canScore ? null : (
+    <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+      {m.status === 'SCHEDULED' && <button className="btn pri" onClick={() => startMatch(m)}>Start</button>}
+      {m.status === 'LIVE' && <>
+        {([1, 4, 6] as const).map((n) => <button key={'a' + n} className="btn ghost" onClick={() => addRuns(m.id, 'A', n)}>{abbr(m.teamA)} +{n}</button>)}
+        {([1, 4, 6] as const).map((n) => <button key={'b' + n} className="btn ghost" onClick={() => addRuns(m.id, 'B', n)}>{abbr(m.teamB)} +{n}</button>)}
+        <button className="btn" onClick={() => bowl(m.id)}>Bowl ball</button><button className="btn pri" onClick={() => finalize(m)}>End match</button>
+      </>}
+    </span>
+  );
+
+  const Side = (
+    <aside>
+      <div className="side-block">
+        <h3 className="side">Live Database</h3>
+        <p style={{ margin: '0 0 10px', fontSize: 13, color: 'var(--mute)' }}>Every score on this site is stored in Amazon DynamoDB. Open the table to see items change live.</p>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><Ext cls="btn pri" href={DDB_URL}>Open DynamoDB table</Ext><button className="btn" onClick={() => setTab('aws')}>Demo page</button></div>
+      </div>
+      <div className="side-block">
+        <h3 className="side">Fan Poll: Champion</h3>
+        {teams.map((t) => { const v = votes[t.teamName] || 0; return (
+          <button key={t.id} onClick={() => setVotes((p) => ({ ...p, [t.teamName]: (p[t.teamName] || 0) + 1 }))} style={{ all: 'unset', display: 'block', width: '100%', cursor: 'pointer', padding: '6px 0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}><span>{t.teamName}</span><span>{Math.round((v / totalVotes) * 100)}%</span></div>
+            <div className="bar"><i style={{ width: `${(v / totalVotes) * 100}%`, background: tc(t.teamName) }} /></div>
+          </button>); })}
+      </div>
+      {role === 'ADMIN' && (
+        <div className="side-block">
+          <h3 className="side">Administration</h3>
+          <form onSubmit={addTeam} style={{ display: 'flex', gap: 8, marginBottom: 10 }}><input className="inp" value={newTeam} onChange={(e) => setNewTeam(e.target.value)} placeholder="New team name" /><button className="btn" type="submit">Add</button></form>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><button className="btn pri" onClick={generate}>Generate fixtures</button><button className="btn" onClick={exportCSV}>Export CSV</button>{API && <button className="btn" onClick={refresh}>Sync now</button>}</div>
+        </div>
+      )}
+    </aside>
+  );
+
+  const prof = profile ? teams.find((t) => t.teamName === profile) : null;
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+
+      <div className="top"><div className="wrap">
+        <span>Inter-College Premier League 2026 &nbsp;|&nbsp; <span style={{ color: syncColor }}>AWS: {sync}</span>{lastSync && liveSync ? ` (synced ${lastSync})` : ''}</span>
+        <span>{(['ADMIN', 'REFEREE', 'SPECTATOR'] as const).map((r) => <button key={r} className={role === r ? 'on' : ''} onClick={() => setRole(r)}>{r.charAt(0) + r.slice(1).toLowerCase()}</button>)}</span>
+      </div></div>
+
+      <div className="nav"><div className="wrap">
+        <div className="logo"><i>ICPL</i>Premier League</div>
+        <div className="tabs">{tabs.map(([id, l]) => <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{l}</button>)}</div>
+        <div className="right">
+          {API && <button className="btn lt" onClick={() => setLiveSync(!liveSync)}>{liveSync ? 'Live sync: On' : 'Live sync: Off'}</button>}
+          <button className="btn lt" onClick={() => setAuto(!auto)}>{auto ? 'Auto-play: On' : 'Auto-play: Off'}</button>
+        </div>
+      </div></div>
+
+      <div className="ticker"><div className="wrap">
+        {matches.slice(0, 8).map((m) => (
+          <div className="tk" key={m.id}><span className={`tag ${tag(m.status)}`}>{tagText(m.status)}</span><Crest name={m.teamA} size={20} /><b>{m.scoreA}</b><span style={{ color: 'var(--mute)' }}>-</span><b>{m.scoreB}</b><Crest name={m.teamB} size={20} /></div>
+        ))}
+      </div></div>
+
+      {tab === 'home' && feat && (
+        <div className="hero"><div className="wrap">
+          <div className="hero-h"><span>{feat.status === 'LIVE' ? 'LIVE NOW' : 'FEATURED MATCH'}  /  {(VENUES[feat.venue]?.stadium || feat.venue).toUpperCase()}</span><span>OVERS {Math.floor(feat.balls / 6)}.{feat.balls % 6}</span></div>
+          <div className="hero-g">
+            <div>
+              <div className="hs">
+                <div><Crest name={feat.teamA} size={72} /><div className="n">{feat.teamA}</div></div>
+                <div className="big">{feat.scoreA}<em>-</em>{feat.scoreB}</div>
+                <div><Crest name={feat.teamB} size={72} /><div className="n">{feat.teamB}</div></div>
+              </div>
+              <div style={{ margin: '24px 0 16px' }}><Prob m={feat} dark /></div>
+              <div style={{ marginBottom: 14 }}><Feed feed={feat.feed} /></div>
+              <div style={{ color: '#cbd5e1', marginBottom: 18 }}>{feat.commentary}</div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><button className="btn pri" onClick={() => setTab('matches')}>Open live centre</button><Ext cls="btn lt" href={DDB_URL}>Watch it update in DynamoDB</Ext></div>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: '.1em', color: '#93a4c3', marginBottom: 8 }}>SCORE PROGRESSION (PER BALL)</div>
+              <Worm a={feat.runsA} b={feat.runsB} ca={tc(feat.teamA)} cb={tc(feat.teamB)} h={190} />
+            </div>
+          </div>
+        </div></div>
+      )}
+
+      <main className="wrap">
+        {tab === 'home' && (
+          <div className="layout">
+            <section>
+              <h2 className="sec">League Standings</h2>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
+                <input className="inp" style={{ maxWidth: 260 }} placeholder="Search teams" value={query} onChange={(e) => setQuery(e.target.value)} />
+                <Ext href={TEAMS_URL}>Standings in DynamoDB</Ext>
+              </div>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="t">
+                  <thead><tr><th style={{ width: 44 }}>POS</th><th>TEAM</th><th className="c">P</th><th className="c">NRR</th><th style={{ width: 140 }}>POINTS</th><th className="r">PTS</th></tr></thead>
+                  <tbody>
+                    {sorted.map((t, i) => (
+                      <tr key={t.id}>
+                        <td style={{ fontWeight: 800, color: i === 0 ? 'var(--accent)' : undefined }}>{i + 1}</td>
+                        <td style={{ fontWeight: 700, cursor: 'pointer' }} onClick={() => setProfile(t.teamName)}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}><Crest name={t.teamName} size={26} />{t.teamName}</span></td>
+                        <td className="c">{t.matchesPlayed}</td>
+                        <td className={`c ${t.netScoreRate >= 0 ? 'pos' : 'neg'}`}>{t.netScoreRate >= 0 ? '+' : ''}{t.netScoreRate.toFixed(2)}</td>
+                        <td><div className="bar" style={{ height: 6 }}><i style={{ width: `${(t.points / maxPts) * 100}%`, background: tc(t.teamName) }} /></div></td>
+                        <td className="r" style={{ fontWeight: 800, fontSize: 16 }}>{t.points}</td>
+                      </tr>
+                    ))}
+                    {!sorted.length && <tr><td colSpan={6} style={{ color: 'var(--mute)', textAlign: 'center' }}>No results.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ marginTop: 40 }}>
+                <h2 className="sec">Latest News</h2>
+                {news.slice(0, 4).map((n) => <div className="news" key={n.id}><time>{n.t}</time><div><span className="tag next">{n.tag}</span> {n.text}</div></div>)}
+                <div style={{ marginTop: 12 }}><button className="btn" onClick={() => setTab('news')}>All news</button></div>
+              </div>
+            </section>
+            {Side}
+          </div>
+        )}
+
+        {tab === 'matches' && (
+          <div className="layout">
+            <section>
+              <h2 className="sec">Live Scores</h2>
+              {matches.map((m) => (
+                <div className="mc" key={m.id}>
+                  <div className="mc-h"><span>{m.id}  /  {(VENUES[m.venue]?.stadium || m.venue).toUpperCase()}  /  OVERS {Math.floor(m.balls / 6)}.{m.balls % 6}</span><span className={`tag ${tag(m.status)}`}>{m.status === 'LIVE' && <span className="dot" />}{tagText(m.status)}</span></div>
+                  <div className="mc-b">
+                    <div className="tm" onClick={() => setProfile(m.teamA)}><Crest name={m.teamA} size={40} />{m.teamA}</div>
+                    <div className="sc">{m.scoreA}<em>-</em>{m.scoreB}</div>
+                    <div className="tm" style={{ justifyContent: 'flex-end' }} onClick={() => setProfile(m.teamB)}>{m.teamB}<Crest name={m.teamB} size={40} /></div>
+                  </div>
+                  <div style={{ padding: '0 16px 12px' }}><Worm a={m.runsA} b={m.runsB} ca={tc(m.teamA)} cb={tc(m.teamB)} h={110} /></div>
+                  <div style={{ padding: '0 16px 14px', display: 'grid', gap: 12 }}><Prob m={m} /><div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, color: 'var(--mute)', letterSpacing: '.08em' }}>LAST 12 BALLS <Feed feed={m.feed} /></div></div>
+                  <div className="mc-f">
+                    <span style={{ color: 'var(--mute)' }}>{m.commentary}</span>
+                    <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}><Controls m={m} /><Ext cls="btn ghost" href={DDB_URL}>View in DynamoDB</Ext></span>
+                  </div>
+                </div>
+              ))}
+            </section>
+            {Side}
+          </div>
+        )}
+
+        {tab === 'fixtures' && (
+          <div className="page">
+            <h2 className="sec">Fixtures and Predictor</h2>
+            <p style={{ color: 'var(--mute)', margin: '0 0 16px' }}>Pick a winner for each match. Your record: <b>{pickRight}/{pickCount}</b> correct on completed matches.</p>
+            <div className="cards" style={{ marginBottom: 40, gridTemplateColumns: 'repeat(auto-fill,minmax(340px,1fr))' }}>
+              {matches.map((m, i) => (
+                <div className="card" key={m.id}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--mute)', marginBottom: 12 }}><span>{dayStr(i)}  /  7:30 PM</span><span className={`tag ${tag(m.status)}`}>{tagText(m.status)}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <div style={{ textAlign: 'center', flex: 1 }}><Crest name={m.teamA} size={44} /><div style={{ fontWeight: 700, marginTop: 6, fontSize: 13 }}>{m.teamA}</div></div>
+                    <div style={{ fontWeight: 300, fontSize: m.status === 'SCHEDULED' ? 14 : 24, color: 'var(--mute)' }}>{m.status === 'SCHEDULED' ? 'VS' : `${m.scoreA}-${m.scoreB}`}</div>
+                    <div style={{ textAlign: 'center', flex: 1 }}><Crest name={m.teamB} size={44} /><div style={{ fontWeight: 700, marginTop: 6, fontSize: 13 }}>{m.teamB}</div></div>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--mute)', margin: '12px 0' }}>{VENUES[m.venue]?.stadium || m.venue}</div>
+                  {m.status !== 'COMPLETED' ? (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 11, alignSelf: 'center', color: 'var(--mute)' }}>PREDICT</span>
+                      {[m.teamA, m.teamB].map((t) => <button key={t} className={`btn ${picks[m.id] === t ? 'sel' : 'ghost'}`} onClick={() => setPicks((p) => ({ ...p, [m.id]: t }))}>{abbr(t)}</button>)}
+                      <button className="btn ghost" onClick={() => addToCal(m, i)}>Add to calendar</button>
+                    </div>
+                  ) : <div style={{ fontSize: 12 }}>{picks[m.id] ? (picks[m.id] === winner(m) ? <span className="pos">Your pick was correct</span> : <span className="neg">Your pick was wrong</span>) : <span style={{ color: 'var(--mute)' }}>No prediction made</span>}</div>}
+                </div>
+              ))}
+            </div>
+            <h2 className="sec">Playoff Bracket</h2>
+            {top4.length < 4 ? <p>At least four teams are required.</p> : (
+              <div className="bk">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                  {[[top4[0], top4[3]], [top4[1], top4[2]]].map(([a, b], i) => (
+                    <div className="g" key={i}><div className="hd">SEMI-FINAL {i + 1}</div>{[a, b].map((t) => <div key={t.id}><span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}><Crest name={t.teamName} size={20} />{t.teamName}</span><span style={{ color: 'var(--mute)' }}>{t.points}</span></div>)}</div>
+                  ))}
+                </div>
+                <div style={{ width: 48, height: 1, background: 'var(--ink)' }} />
+                <div className="g" style={{ borderColor: 'var(--accent)' }}><div className="hd" style={{ background: 'var(--accent)' }}>FINAL</div><div><span>Winner SF1</span></div><div><span>Winner SF2</span></div></div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'teams' && (
+          <div className="page">
+            <h2 className="sec">Teams</h2>
+            <div className="cards" style={{ marginBottom: 40 }}>
+              {sortT(teams).map((t, i) => (
+                <div className="card click" key={t.id} onClick={() => setProfile(t.teamName)} style={{ borderTop: `4px solid ${tc(t.teamName)}` }}>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}><Crest name={t.teamName} size={52} /><div><b>{t.teamName}</b><div style={{ fontSize: 12, color: 'var(--mute)' }}>Rank {i + 1}  /  {t.points} pts</div></div></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 14, fontSize: 12, color: 'var(--mute)' }}><span>Played {t.matchesPlayed}</span><span>NRR {t.netScoreRate.toFixed(2)}</span><span>View profile</span></div>
+                </div>
+              ))}
+            </div>
+            {cA && cB && (
+              <>
+                <h2 className="sec">Head to Head</h2>
+                <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
+                  <select className="inp" style={{ maxWidth: 260 }} value={cA.teamName} onChange={(e) => setCmpA(e.target.value)}>{teams.map((t) => <option key={t.id}>{t.teamName}</option>)}</select>
+                  <select className="inp" style={{ maxWidth: 260 }} value={cB.teamName} onChange={(e) => setCmpB(e.target.value)}>{teams.map((t) => <option key={t.id}>{t.teamName}</option>)}</select>
+                </div>
+                {[['Points', cA.points, cB.points], ['Matches played', cA.matchesPlayed, cB.matchesPlayed], ['Net run rate', cA.netScoreRate, cB.netScoreRate], ['Win rate %', cA.matchesPlayed ? Math.round((cA.points / 3 / cA.matchesPlayed) * 100) : 0, cB.matchesPlayed ? Math.round((cB.points / 3 / cB.matchesPlayed) * 100) : 0]].map(([l, a, b]) => {
+                  const A = Number(a), B = Number(b), tot = Math.abs(A) + Math.abs(B) || 1;
+                  return (
+                    <div key={l as string} style={{ marginBottom: 14 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}><b>{A}</b><span style={{ color: 'var(--mute)', fontSize: 11, letterSpacing: '.08em' }}>{(l as string).toUpperCase()}</span><b>{B}</b></div>
+                      <div className="split" style={{ background: 'var(--line)' }}><i style={{ width: `${(Math.abs(A) / tot) * 100}%`, background: tc(cA.teamName) }} /><i style={{ width: `${(Math.abs(B) / tot) * 100}%`, background: tc(cB.teamName) }} /></div>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        )}
+
+        {tab === 'venues' && (() => {
+          const V = VENUES[venue];
+          return (
+            <div className="page">
+              <h2 className="sec">Venues</h2>
+              <div className="grid2" style={{ gridTemplateColumns: 'minmax(260px,320px) minmax(0,1fr)' }}>
+                <div>
+                  {Object.entries(VENUES).map(([k, v]) => (
+                    <div key={k} className="card click" onClick={() => setVenue(k)} style={{ marginBottom: 12, borderLeft: `4px solid ${venue === k ? 'var(--accent)' : 'var(--line)'}` }}>
+                      <b>{v.stadium}</b><div style={{ fontSize: 12, color: 'var(--mute)' }}>{k}  /  capacity {v.cap}</div>
+                    </div>
+                  ))}
+                  <h3 className="side" style={{ marginTop: 24 }}>Conditions</h3>
+                  {wxLoading ? <div style={{ color: 'var(--mute)' }}>Loading...</div> : wx && (<><div className="kv"><span>Temperature</span><b>{wx.temp} °C</b></div><div className="kv"><span>Wind</span><b>{wx.wind} km/h</b></div><div className="kv"><span>Conditions</span><b>{wx.desc}</b></div><div className="kv"><span>Source</span><span>{wx.src}</span></div></>)}
+                </div>
+                <div>
+                  <div style={{ border: '1px solid var(--line)' }}>
+                    <iframe title="Venue map" loading="lazy" style={{ width: '100%', height: 420, border: 0, display: 'block' }} src={`https://www.openstreetmap.org/export/embed.html?bbox=${V.lon - 0.025}%2C${V.lat - 0.014}%2C${V.lon + 0.025}%2C${V.lat + 0.014}&layer=mapnik&marker=${V.lat}%2C${V.lon}`} />
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, margin: '14px 0 24px', flexWrap: 'wrap' }}>
+                    <Ext cls="btn pri" href={`https://www.google.com/maps/dir/?api=1&destination=${V.lat},${V.lon}`}>Get directions</Ext>
+                    <Ext href={`https://www.openstreetmap.org/?mlat=${V.lat}&mlon=${V.lon}#map=16/${V.lat}/${V.lon}`}>Open full map</Ext>
+                  </div>
+                  <h3 className="side">Matches at {V.stadium}</h3>
+                  {matches.filter((m) => m.venue === venue).map((m) => <div className="kv" key={m.id}><span>{m.teamA} v {m.teamB}</span><b>{m.scoreA}-{m.scoreB} <span className={`tag ${tag(m.status)}`}>{tagText(m.status)}</span></b></div>)}
+                  {!matches.some((m) => m.venue === venue) && <p style={{ color: 'var(--mute)' }}>No matches scheduled here yet.</p>}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {tab === 'news' && (
+          <div className="page" style={{ maxWidth: 820 }}>
+            <h2 className="sec">News and Match Reports</h2>
+            <p style={{ color: 'var(--mute)', margin: '0 0 16px' }}>This feed updates automatically as matches start, finish and teams register.</p>
+            {news.map((n) => <div className="news" key={n.id}><time>{n.t}</time><div><span className="tag next">{n.tag}</span> {n.text}</div></div>)}
+          </div>
+        )}
+
+        {tab === 'stats' && sel && (
+          <div className="page">
+            <h2 className="sec">Tournament Statistics</h2>
+            <div className="kpi">{[['TEAMS', teams.length], ['MATCHES', matches.length], ['TOTAL RUNS', matches.reduce((s, m) => s + m.scoreA + m.scoreB, 0)], ['BALLS BOWLED', matches.reduce((s, m) => s + m.balls, 0)]].map(([l, v]) => <div key={l as string}><small>{l}</small><b>{v}</b></div>)}</div>
+            <div className="grid2" style={{ marginBottom: 40 }}>
+              <div><h3 className="side">Top Run Scorers</h3>{[...players].sort((a, b) => b.runs - a.runs).slice(0, 5).map((p, i) => <div className="kv" key={p.name + i}><span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}><Crest name={p.team} size={18} /><b style={{ color: 'var(--ink)' }}>{p.name}</b></span><b>{p.runs}</b></div>)}</div>
+              <div><h3 className="side">Top Wicket Takers</h3>{[...players].sort((a, b) => b.wkts - a.wkts).slice(0, 5).map((p, i) => <div className="kv" key={p.name + i}><span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}><Crest name={p.team} size={18} /><b style={{ color: 'var(--ink)' }}>{p.name}</b></span><b>{p.wkts}</b></div>)}</div>
+            </div>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 16 }}>
+              <span style={{ fontSize: 12, color: 'var(--mute)' }}>MATCH</span>
+              <select className="inp" style={{ maxWidth: 360 }} value={sel.id} onChange={(e) => setSelMatch(e.target.value)}>{matches.map((m) => <option key={m.id} value={m.id}>{m.id}: {m.teamA} v {m.teamB}</option>)}</select>
+            </div>
+            <div className="grid2">
+              <div><h3 className="side">Score Progression</h3><Worm a={sel.runsA} b={sel.runsB} ca={tc(sel.teamA)} cb={tc(sel.teamB)} h={180} /></div>
+              <div><h3 className="side">Win Probability ({abbr(sel.teamA)})</h3><Worm a={sel.history} b={sel.history.map((v) => 100 - v)} ca={tc(sel.teamA)} cb={tc(sel.teamB)} h={180} max={100} /></div>
+              <div><h3 className="side">Ball Outcome Breakdown</h3><Donut dist={sel.dist} /></div>
+              <div><h3 className="side">Net Run Rate</h3>
+                {sortT(teams).map((t) => (
+                  <div key={t.id} style={{ display: 'grid', gridTemplateColumns: '60px 1fr 50px', gap: 10, alignItems: 'center', padding: '7px 0', fontSize: 12 }}>
+                    <span>{abbr(t.teamName)}</span>
+                    <div style={{ position: 'relative', height: 10, background: 'var(--panel)' }}>
+                      <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: 1, background: 'var(--ink)' }} />
+                      <div style={{ position: 'absolute', top: 0, bottom: 0, left: t.netScoreRate >= 0 ? '50%' : `${50 - (Math.abs(t.netScoreRate) / maxNrr) * 50}%`, width: `${(Math.abs(t.netScoreRate) / maxNrr) * 50}%`, background: t.netScoreRate >= 0 ? 'var(--live)' : 'var(--accent)' }} />
+                    </div>
+                    <b className="r">{t.netScoreRate.toFixed(2)}</b>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab === 'aws' && (
+          <div className="page">
+            <h2 className="sec">AWS Live Demo</h2>
+            <div className="card" style={{ background: 'var(--navy)', color: '#fff', marginBottom: 32, display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ maxWidth: 560 }}>
+                <div style={{ fontSize: 11, letterSpacing: '.12em', color: '#93a4c3' }}>DYNAMODB TABLE: {DDB}  /  REGION {REGION}</div>
+                <div style={{ fontSize: 20, fontWeight: 700, margin: '6px 0' }}>Watch the database update while you score</div>
+                <div style={{ color: '#cbd5e1' }}>Open the table in AWS in a new tab. Then use the button here to send a score. Press Refresh on the AWS page and the item changes.</div>
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}><Ext cls="btn pri" href={DDB_URL}>Open DynamoDB items</Ext><Ext cls="btn lt" href={TEAMS_URL}>Open standings table</Ext></div>
+            </div>
+            <div className="kpi">
+              <div><small>CONNECTION</small><b style={{ color: syncColor, fontSize: 22 }}>{sync}</b></div>
+              <div><small>WRITES TO AWS</small><b>{writes}</b></div>
+              <div><small>ITEMS IN TABLE</small><b>{raw.length}</b></div>
+              <div><small>LAST READ</small><b style={{ fontSize: 20 }}>{lastSync || '-'}</b></div>
+            </div>
+            <div className="grid2" style={{ marginBottom: 40 }}>
+              <div>
+                <h3 className="side">Faculty Demo Script</h3>
+                {[['Open the DynamoDB link above', 'Choose the LiveMatches table and press "Run" to list the items.'], ['Send a test update', 'Click the button below. The site sends a PUT request through API Gateway and Lambda.'], ['Refresh the AWS page', 'The scoreA value of the live match has increased by one.'], ['Edit the item in AWS', 'Change scoreA in the DynamoDB console and save. This site updates within 3 seconds.'], ['Show the logs', 'Open CloudWatch Logs to see each request handled by the Lambda function.']].map(([a, b], i) => (
+                  <div className="stepn" key={a}><b>{i + 1}</b><div><b style={{ display: 'block', background: 'none', color: 'var(--ink)', width: 'auto', height: 'auto', fontSize: 14, placeItems: 'start' }}>{a}</b><span style={{ color: 'var(--mute)' }}>{b}</span></div></div>
+                ))}
+                <div style={{ display: 'flex', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
+                  <button className="btn pri" onClick={sendTest}>Send test update (+1 run)</button>
+                  {API && <button className="btn" onClick={refresh}>Read from AWS now</button>}
+                  <button className="btn ghost" onClick={() => setAuto(!auto)}>{auto ? 'Stop auto-play' : 'Start auto-play'}</button>
+                </div>
+              </div>
+              <div>
+                <h3 className="side">Raw Items From DynamoDB (live)</h3>
+                <table className="t" style={{ marginBottom: 10 }}>
+                  <thead><tr><th>ID</th><th>TEAMS</th><th className="c">SCORE</th><th>STATUS</th></tr></thead>
+                  <tbody>{raw.map((r: any) => <tr key={r.id}><td className="res" style={{ background: 'none' }}>{r.id}</td><td>{abbr(r.teamA || '')} v {abbr(r.teamB || '')}</td><td className="c"><b>{r.scoreA}-{r.scoreB}</b></td><td>{r.status}</td></tr>)}{!raw.length && <tr><td colSpan={4} style={{ color: 'var(--mute)' }}>{API ? 'Table is empty. Open Live Scores once to create the items.' : 'Backend not configured.'}</td></tr>}</tbody>
+                </table>
+                {raw[0] && <pre className="pre">{JSON.stringify({ ...(raw.find((r: any) => r.status === 'LIVE') || raw[0]), history: '[..]', runsA: '[..]', runsB: '[..]' }, null, 2)}</pre>}
+              </div>
+            </div>
+            <h2 className="sec">AWS Services</h2>
+            <div className="cards" style={{ marginBottom: 40, gridTemplateColumns: 'repeat(auto-fill,minmax(300px,1fr))' }}>
+              {LINKS.map((l) => <div className="card" key={l.name}><b>{l.name}</b><div style={{ color: 'var(--mute)', fontSize: 13, margin: '4px 0 10px' }}>{l.desc}</div><span className="res">{l.res}</span><div style={{ marginTop: 12 }}><Ext href={l.url}>Open in AWS Console</Ext></div></div>)}
+            </div>
+            <div className="grid2">
+              <section><h3 className="side">Console</h3><div className="con">{logs.map((l, i) => <div key={i}>{l}</div>)}</div>
+                <form onSubmit={(e) => { e.preventDefault(); runCmd(cmd); setCmd(''); }} style={{ display: 'flex', gap: 8, marginTop: 8 }}><input className="inp" style={{ fontFamily: 'ui-monospace,monospace' }} value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder='Type "help"' /><button className="btn" type="submit">Run</button></form></section>
+              <section><h3 className="side">Network Inspector</h3>
+                <table className="t" style={{ fontFamily: 'ui-monospace,monospace', fontSize: 12 }}>
+                  <thead><tr><th>METHOD</th><th>URL</th><th>STATUS</th><th className="r">TIME</th></tr></thead>
+                  <tbody>{net.slice(0, 8).map((c) => <tr key={c.id}><td>{c.method}</td><td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={c.url}>{c.url}</td><td className={c.status === 200 ? 'pos' : c.status === 'ERR' ? 'neg' : ''}>{c.status}</td><td className="r">{c.ms} ms</td></tr>)}{!net.length && <tr><td colSpan={4} style={{ color: 'var(--mute)' }}>No requests yet.</td></tr>}</tbody>
+                </table>
+                <div style={{ display: 'flex', gap: 8, marginTop: 12 }}><button className="btn ghost" onClick={() => setNet([])}>Clear</button>{role === 'ADMIN' && <button className="btn ghost" onClick={reset}>Reset local data</button>}</div>
+              </section>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {prof && (
+        <div className="modal" onClick={() => setProfile(null)}>
+          <div className="mbox" onClick={(e) => e.stopPropagation()}>
+            <div className="mhead" style={{ background: tc(prof.teamName) }}><Crest name={prof.teamName} size={64} /><div><div style={{ fontSize: 22, fontWeight: 800 }}>{prof.teamName}</div><div style={{ opacity: 0.85 }}>Rank {sortT(teams).findIndex((t) => t.id === prof.id) + 1}  /  {prof.points} points</div></div><button className="btn lt" style={{ marginLeft: 'auto' }} onClick={() => setProfile(null)}>Close</button></div>
+            <div style={{ padding: 24 }}>
+              <div className="kpi" style={{ marginBottom: 20 }}><div><small>PLAYED</small><b>{prof.matchesPlayed}</b></div><div><small>POINTS</small><b>{prof.points}</b></div><div><small>NRR</small><b>{prof.netScoreRate.toFixed(2)}</b></div><div><small>WIN %</small><b>{prof.matchesPlayed ? Math.round((prof.points / 3 / prof.matchesPlayed) * 100) : 0}</b></div></div>
+              <h3 className="side">Recent Matches</h3>
+              {matches.filter((m) => m.teamA === prof.teamName || m.teamB === prof.teamName).map((m) => <div className="kv" key={m.id}><span>{m.teamA} v {m.teamB}</span><b>{m.scoreA}-{m.scoreB} <span className={`tag ${tag(m.status)}`}>{tagText(m.status)}</span></b></div>)}
+              <h3 className="side" style={{ marginTop: 20 }}>Squad</h3>
+              <table className="t"><thead><tr><th>PLAYER</th><th>ROLE</th><th className="c">RUNS</th><th className="c">WKTS</th></tr></thead><tbody>{squad(prof.teamName).map((p) => <tr key={p.name}><td><b>{p.name}</b></td><td>{p.role}</td><td className="c">{p.runs}</td><td className="c">{p.wkts}</td></tr>)}</tbody></table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer><div className="wrap" style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <span>Inter-College Premier League. Hosted on AWS ({REGION}): API Gateway, Lambda, DynamoDB, CloudWatch, S3.</span>
+        <span>© 2026 ICPL Organising Committee</span>
+      </div></footer>
+
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}

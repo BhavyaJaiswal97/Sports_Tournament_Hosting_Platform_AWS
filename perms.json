@@ -1,0 +1,3 @@
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["dynamodb:PutItem","dynamodb:Scan"],"Resource":"arn:aws:dynamodb:ap-southeast-2:398021156732:table/Matches"},
+ {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::sports-tournament-brackets-bhavya-2026/*"}]}
