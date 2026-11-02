@@ -4,9 +4,8 @@ A scalable web platform for hosting and managing sports tournaments built with *
 
 ---
 
-## 🚀 Live Demo & Links
+## 📂 Repository Links
 
-* 🌐 **Live Website:** [Click Here to View Live React App](https://YOUR-ACTUAL-DEPLOYED-URL-HERE)
 * 📂 **GitHub Repository:** [BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS](https://github.com/BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS)
 
 ---
@@ -19,7 +18,7 @@ A scalable web platform for hosting and managing sports tournaments built with *
 
 ---
 
-## ⚙️ Getting Started Locally
+## ⚙️ How to Run Locally
 
 1. **Clone the repository:**
    ```bash
