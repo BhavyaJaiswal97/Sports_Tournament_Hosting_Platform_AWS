@@ -1,32 +1,27 @@
-# React + TypeScript + Vite
+# 🏆 Sports Tournament Hosting Platform (AWS)
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A scalable web platform for hosting and managing sports tournaments built with **React**, **TypeScript**, **Vite**, and **AWS Services**.
 
-Currently, two official plugins are available:
+---
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 🚀 Live Demo & Links
 
-## React Compiler
+* 🌐 **Live Website:** [Click Here to Open App](YOUR_LIVE_WEBSITE_URL_HERE) *(Replace `YOUR_LIVE_WEBSITE_URL_HERE` with your AWS CloudFront, S3, or Amplify link)*
+* 📂 **GitHub Repository:** [BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS](https://github.com/BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS)
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the Oxlint configuration
+## 🛠️ Tech Stack & Architecture
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+* **Frontend:** React, TypeScript, Vite
+* **Backend & Cloud:** AWS Amplify, AWS Lambda
+* **Monitoring:** AWS CloudWatch
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
+---
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## ⚙️ Getting Started Locally
+
+1. **Clone the repository:**
+   ```bash
+   git clone [https://github.com/BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS.git](https://github.com/BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS.git)
+   cd Sports_Tournament_Hosting_Platform_AWS
