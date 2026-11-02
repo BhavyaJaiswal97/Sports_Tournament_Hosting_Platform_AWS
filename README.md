@@ -1,21 +1,21 @@
 # 🏆 Sports Tournament Hosting Platform (AWS)
 
-A scalable web platform for hosting and managing sports tournaments built with **React**, **TypeScript**, **Vite**, and **AWS Services**.
+A scalable web platform for hosting and managing sports tournaments built with **React**, **TypeScript**, **Vite**, and **AWS Services**[cite: 1].
 
 ---
 
 ## 🚀 Live Demo & Links
 
-* 🌐 **Live Website:** [Click Here to Open App](YOUR_LIVE_WEBSITE_URL_HERE) *(Replace `YOUR_LIVE_WEBSITE_URL_HERE` with your AWS CloudFront, S3, or Amplify link)*
+* 🌐 **Live Website:** [Click Here to View Live React App](https://YOUR-ACTUAL-DEPLOYED-URL-HERE)
 * 📂 **GitHub Repository:** [BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS](https://github.com/BhavyaJaiswal97/Sports_Tournament_Hosting_Platform_AWS)
 
 ---
 
 ## 🛠️ Tech Stack & Architecture
 
-* **Frontend:** React, TypeScript, Vite
-* **Backend & Cloud:** AWS Amplify, AWS Lambda
-* **Monitoring:** AWS CloudWatch
+* **Frontend:** React, TypeScript, Vite[cite: 1]
+* **Backend & Cloud:** AWS Amplify, AWS Lambda[cite: 1]
+* **Monitoring:** AWS CloudWatch[cite: 1]
 
 ---
 
